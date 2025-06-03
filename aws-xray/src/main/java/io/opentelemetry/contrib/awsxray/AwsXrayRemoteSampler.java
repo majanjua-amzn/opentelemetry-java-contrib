@@ -13,7 +13,11 @@ import io.opentelemetry.contrib.awsxray.GetSamplingTargetsRequest.SamplingStatis
 import io.opentelemetry.contrib.awsxray.GetSamplingTargetsResponse.SamplingTargetDocument;
 import io.opentelemetry.sdk.common.Clock;
 import io.opentelemetry.sdk.resources.Resource;
+import io.opentelemetry.sdk.trace.ReadableSpan;
 import io.opentelemetry.sdk.trace.data.LinkData;
+import io.opentelemetry.sdk.trace.data.SpanData;
+import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
+import io.opentelemetry.sdk.trace.export.SpanExporter;
 import io.opentelemetry.sdk.trace.samplers.Sampler;
 import io.opentelemetry.sdk.trace.samplers.SamplingResult;
 import java.io.Closeable;
@@ -43,6 +47,9 @@ public final class AwsXrayRemoteSampler implements Sampler, Closeable {
 
   private static final Logger logger = Logger.getLogger(AwsXrayRemoteSampler.class.getName());
 
+  // Default batch size to be same as OTel BSP default
+  private static final int maxExportBatchSize = 512;
+
   private final Resource resource;
   private final Clock clock;
   private final Sampler initialSampler;
@@ -57,6 +64,9 @@ public final class AwsXrayRemoteSampler implements Sampler, Closeable {
   @Nullable private volatile ScheduledFuture<?> fetchTargetsFuture;
   @Nullable private volatile GetSamplingRulesResponse previousRulesResponse;
   private volatile Sampler sampler;
+
+  // Used to batch error spans captured for adaptive sampling
+  @Nullable private BatchSpanProcessor bsp;
 
   /**
    * Returns a {@link AwsXrayRemoteSamplerBuilder} with the given {@link Resource}. This {@link
@@ -119,11 +129,34 @@ public final class AwsXrayRemoteSampler implements Sampler, Closeable {
     return "AwsXrayRemoteSampler{" + sampler.getDescription() + "}";
   }
 
+  public void setSpanExporter(SpanExporter spanExporter) {
+    if (this.bsp != null) {
+      throw new IllegalStateException("Programming bug - BatchSpanProcessor is already set");
+    }
+    else if (spanExporter != null && this.bsp == null) {
+      bsp = BatchSpanProcessor.builder(spanExporter)
+      .setExportUnsampledSpans(true) // Required to capture the unsampled error spans
+      .setMaxExportBatchSize(maxExportBatchSize)
+      .build();
+    }
+  }
+
+  public void adaptSampling(ReadableSpan span, SpanData spanData) {
+    if (this.bsp == null) {
+      throw new IllegalStateException("Programming bug - BatchSpanProcessor is null while trying to adapt sampling");
+    }
+    if (sampler instanceof XrayRulesSampler) {
+      ((XrayRulesSampler) sampler).adaptSampling(span, spanData, this.bsp::onEnd);
+    }
+  }
+
   private void getAndUpdateSampler() {
+    logger.log(Level.SEVERE, "Updating sampler");
     try {
       // No pagination support yet, or possibly ever.
       GetSamplingRulesResponse response =
           client.getSamplingRules(GetSamplingRulesRequest.create(null));
+      logger.log(Level.SEVERE, "Got sampling rules: {0}", response);
       if (!response.equals(previousRulesResponse)) {
         sampler =
             new XrayRulesSampler(
@@ -177,14 +210,26 @@ public final class AwsXrayRemoteSampler implements Sampler, Closeable {
     XrayRulesSampler xrayRulesSampler = (XrayRulesSampler) sampler;
     try {
       Date now = Date.from(Instant.ofEpochSecond(0, clock.now()));
-      List<SamplingStatisticsDocument> statistics = xrayRulesSampler.snapshot(now);
+      List<SamplingRuleApplier.SamplingRuleStatisticsSnapshot> statisticsSnapshot = xrayRulesSampler.snapshot(now);
+      // TODO: @majanjua - Can speed this up by using 1 for loop instead
+      List<SamplingStatisticsDocument> statistics =
+          statisticsSnapshot.stream()
+              .map(SamplingRuleApplier.SamplingRuleStatisticsSnapshot::getStatisticsDocument)
+              .collect(Collectors.toList());
+      List<String> boostStatistics =
+          statisticsSnapshot.stream()
+                  .flatMap(snapshot -> snapshot.getBoostStatisticsDocument().stream())
+                  .collect(Collectors.toList());
       Set<String> requestedTargetRuleNames =
           statistics.stream()
               .map(SamplingStatisticsDocument::getRuleName)
               .collect(Collectors.toSet());
 
+      GetSamplingTargetsRequest req = GetSamplingTargetsRequest.create(statistics, boostStatistics);
+      logger.log(Level.SEVERE, "GetSamplingTargetsRequest: {0}", req);
       GetSamplingTargetsResponse response =
-          client.getSamplingTargets(GetSamplingTargetsRequest.create(statistics));
+          client.getSamplingTargets(req);
+      logger.log(Level.SEVERE, "GetSamplingTargetsResponse: {0}", response);
       Map<String, SamplingTargetDocument> targets =
           response.getDocuments().stream()
               .collect(Collectors.toMap(SamplingTargetDocument::getRuleName, Function.identity()));

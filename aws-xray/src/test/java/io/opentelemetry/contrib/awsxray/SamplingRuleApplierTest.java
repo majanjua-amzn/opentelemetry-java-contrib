@@ -623,7 +623,7 @@ class SamplingRuleApplierTest {
     // Got a target!
     SamplingTargetDocument target =
         SamplingTargetDocument.create(0.0, 5, 2, Date.from(now.plusSeconds(10)), "test");
-    applier = applier.withTarget(target, Date.from(now));
+    applier = applier.withTarget(target, Date.from(now), clock.nanoTime());
     // Statistics not expired yet
     assertThat(applier.snapshot(Date.from(now))).isNull();
 
@@ -681,7 +681,7 @@ class SamplingRuleApplierTest {
 
     // Got a target!
     SamplingTargetDocument target = SamplingTargetDocument.create(0.0, 5, null, null, "test");
-    applier = applier.withTarget(target, Date.from(now));
+    applier = applier.withTarget(target, Date.from(now), clock.nanoTime());
     // No reservoir, always use fixed rate (drop)
     assertThat(doSample(applier)).isEqualTo(SamplingResult.create(SamplingDecision.DROP));
     assertThat(doSample(applier)).isEqualTo(SamplingResult.create(SamplingDecision.DROP));

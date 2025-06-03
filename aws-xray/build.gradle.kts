@@ -11,6 +11,7 @@ dependencies {
   api("io.opentelemetry:opentelemetry-sdk-trace")
 
   compileOnly("io.opentelemetry:opentelemetry-sdk-extension-autoconfigure")
+  compileOnly("io.opentelemetry.semconv:opentelemetry-semconv:1.32.0-alpha")
 
   implementation("com.squareup.okhttp3:okhttp")
   implementation("io.opentelemetry:opentelemetry-semconv")

@@ -62,7 +62,9 @@ abstract class GetSamplingRulesResponse {
         @JsonProperty("ServiceName") String serviceName,
         @JsonProperty("ServiceType") String serviceType,
         @JsonProperty("URLPath") String urlPath,
-        @JsonProperty("Version") int version) {
+        @JsonProperty("Version") int version,
+        @JsonProperty("AnomalySampling") @Nullable String anomalySampling,
+        @JsonProperty("SamplingRateBoost") String samplingRateBoost) {
       return new AutoValue_GetSamplingRulesResponse_SamplingRule(
           attributes,
           fixedRate,
@@ -76,7 +78,9 @@ abstract class GetSamplingRulesResponse {
           serviceName,
           serviceType,
           urlPath,
-          version);
+          version,
+          anomalySampling,
+          samplingRateBoost);
     }
 
     abstract Map<String, String> getAttributes();
@@ -106,5 +110,40 @@ abstract class GetSamplingRulesResponse {
     abstract String getUrlPath();
 
     abstract int getVersion();
+
+    @Nullable
+    abstract String getAnomalySampling();
+
+    @Nullable
+    abstract String getSamplingRateBoost();
   }
+
+  // @AutoValue
+  // abstract static class AnomalySampling {
+  //   @JsonCreator
+  //   static AnomalySampling create(
+  //       @JsonProperty("ErrorCodeIncludes") List<String> errorCodeIncludes,
+  //       @JsonProperty("MaxTracesCapturedPerSecond") int maxTracesCapturedPerSecond) {
+  //     return new AutoValue_GetSamplingRulesResponse_AnomalySampling(errorCodeIncludes, maxTracesCapturedPerSecond);
+  //   }
+
+  //   abstract List<String> getErrorCodeIncludes();
+
+  //   abstract int getMaxTracesCapturedPerSecond();
+  // }
+
+  // @AutoValue
+  // abstract static class SamplingRateBoost {
+  //   @JsonCreator
+  //   static SamplingRateBoost create(
+  //       @JsonProperty("MaxRate") double maxRate,
+  //       @JsonProperty("ServiceToMonitorForFault") List<String> serviceToMonitorForFault) {
+  //     return new AutoValue_GetSamplingRulesResponse_SamplingRateBoost(maxRate, serviceToMonitorForFault);
+  //   }
+
+  //   abstract double getMaxRate();
+
+  //   @Nullable
+  //   abstract List<String> getServiceToMonitorForFault();
+  // }
 }

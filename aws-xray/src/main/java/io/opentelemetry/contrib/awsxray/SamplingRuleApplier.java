@@ -9,17 +9,22 @@ import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.context.Context;
+import io.opentelemetry.contrib.awsxray.GetSamplingTargetsRequest.SamplingBoostStatisticsDocument;
 import io.opentelemetry.contrib.awsxray.GetSamplingTargetsRequest.SamplingStatisticsDocument;
 import io.opentelemetry.contrib.awsxray.GetSamplingTargetsResponse.SamplingTargetDocument;
 import io.opentelemetry.sdk.common.Clock;
 import io.opentelemetry.sdk.resources.Resource;
+import io.opentelemetry.sdk.trace.ReadableSpan;
 import io.opentelemetry.sdk.trace.data.LinkData;
+import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.samplers.Sampler;
 import io.opentelemetry.sdk.trace.samplers.SamplingDecision;
 import io.opentelemetry.sdk.trace.samplers.SamplingResult;
 import io.opentelemetry.semconv.resource.attributes.ResourceAttributes;
 import io.opentelemetry.semconv.trace.attributes.SemanticAttributes;
+
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
@@ -27,11 +32,20 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.Consumer;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+
 import javax.annotation.Nullable;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 final class SamplingRuleApplier {
+
+  private static final Logger logger = Logger.getLogger(SamplingRuleApplier.class.getName());
 
   private static final Map<String, String> XRAY_CLOUD_PLATFORM;
 
@@ -50,11 +64,21 @@ final class SamplingRuleApplier {
 
   private final String clientId;
   private final String ruleName;
+  private final String serviceName;
   private final Clock clock;
   private final Sampler reservoirSampler;
   private final long reservoirEndTimeNanos;
+  private final double fixedRate;
   private final Sampler fixedRateSampler;
   private final boolean borrowing;
+
+  // Adaptive sampling related configs
+  private final int errorsCapturedPerSecond;
+  private final RateLimiter errorCaptureRateLimiter;
+  private final double boostedFixedRate;
+  private final Long boostEndTimeNanos;
+  private final Sampler boostedFixedRateSampler;
+  private final List<String> rulesWatchingThisService;
 
   private final Map<String, Matcher> attributeMatchers;
   private final Matcher urlPathMatcher;
@@ -68,7 +92,7 @@ final class SamplingRuleApplier {
 
   private final long nextSnapshotTimeNanos;
 
-  SamplingRuleApplier(String clientId, GetSamplingRulesResponse.SamplingRule rule, Clock clock) {
+  SamplingRuleApplier(String clientId, GetSamplingRulesResponse.SamplingRule rule, @Nullable String serviceName, List<String> rulesWatchingThisService, Clock clock) {
     this.clientId = clientId;
     this.clock = clock;
     String ruleName = rule.getRuleName();
@@ -81,6 +105,9 @@ final class SamplingRuleApplier {
       ruleName = "default";
     }
     this.ruleName = ruleName;
+
+    // TODO: @majanjua - Ensure choosing a default should be the correct behaviour
+    this.serviceName = serviceName == null ? "default" : serviceName;
 
     // We don't have a SamplingTarget so are ready to report a snapshot right away.
     nextSnapshotTimeNanos = clock.nanoTime();
@@ -98,7 +125,26 @@ final class SamplingRuleApplier {
       reservoirSampler = Sampler.alwaysOff();
       borrowing = false;
     }
-    fixedRateSampler = createFixedRate(rule.getFixedRate());
+    fixedRate = rule.getFixedRate();
+    fixedRateSampler = createFixedRate(fixedRate);
+
+    // TODO: @majanjua - Remove all the parsing once object is passed properly
+    String anomalySamplingConfig = rule.getAnomalySampling();
+    int errorsCapturedPerSecondTemp;
+    if (anomalySamplingConfig != null) {
+      errorsCapturedPerSecondTemp = 1;
+    }
+    else {
+      errorsCapturedPerSecondTemp = 0;
+    }
+
+    errorsCapturedPerSecond = errorsCapturedPerSecondTemp;
+    errorCaptureRateLimiter = new RateLimiter(errorsCapturedPerSecond, errorsCapturedPerSecond, clock);
+
+    boostedFixedRate = fixedRate;
+    boostedFixedRateSampler = createFixedRate(fixedRate);
+    boostEndTimeNanos = clock.nanoTime();
+    this.rulesWatchingThisService = rulesWatchingThisService;
 
     if (rule.getAttributes().isEmpty()) {
       attributeMatchers = Collections.emptyMap();
@@ -121,11 +167,17 @@ final class SamplingRuleApplier {
   private SamplingRuleApplier(
       String clientId,
       String ruleName,
+      String serviceName,
       Clock clock,
       Sampler reservoirSampler,
       long reservoirEndTimeNanos,
+      double fixedRate,
       Sampler fixedRateSampler,
       boolean borrowing,
+      int errorsCapturedPerSecond,
+      List<String> rulesWatchingThisService,
+      double boostedFixedRate,
+      Long boostEndTimeNanos,
       Map<String, Matcher> attributeMatchers,
       Matcher urlPathMatcher,
       Matcher serviceNameMatcher,
@@ -137,11 +189,17 @@ final class SamplingRuleApplier {
       long nextSnapshotTimeNanos) {
     this.clientId = clientId;
     this.ruleName = ruleName;
+    this.serviceName = serviceName;
     this.clock = clock;
     this.reservoirSampler = reservoirSampler;
     this.reservoirEndTimeNanos = reservoirEndTimeNanos;
+    this.fixedRate = fixedRate;
     this.fixedRateSampler = fixedRateSampler;
     this.borrowing = borrowing;
+    this.errorsCapturedPerSecond = errorsCapturedPerSecond;
+    this.rulesWatchingThisService = rulesWatchingThisService;
+    this.boostedFixedRate = boostedFixedRate;
+    this.boostEndTimeNanos = boostEndTimeNanos;
     this.attributeMatchers = attributeMatchers;
     this.urlPathMatcher = urlPathMatcher;
     this.serviceNameMatcher = serviceNameMatcher;
@@ -151,6 +209,10 @@ final class SamplingRuleApplier {
     this.resourceArnMatcher = resourceArnMatcher;
     this.statistics = statistics;
     this.nextSnapshotTimeNanos = nextSnapshotTimeNanos;
+
+    this.errorCaptureRateLimiter = new RateLimiter(errorsCapturedPerSecond, errorsCapturedPerSecond, clock);
+    this.boostedFixedRateSampler = createFixedRate(this.boostedFixedRate);
+
   }
 
   @SuppressWarnings("deprecation") // TODO
@@ -237,45 +299,118 @@ final class SamplingRuleApplier {
       statistics.sampled.increment();
       return result;
     }
-    result =
-        fixedRateSampler.shouldSample(
-            parentContext, traceId, name, spanKind, attributes, parentLinks);
+
+    logger.log(Level.SEVERE, "Clock.nanoTime()={0}; boostEndTimeNanos={1}", new Object[]{clock.nanoTime(), boostEndTimeNanos});
+    if (clock.nanoTime() < boostEndTimeNanos) {
+      logger.log(Level.SEVERE, "Using boosted sampler");
+      result = boostedFixedRateSampler.shouldSample(
+          parentContext, traceId, name, spanKind, attributes, parentLinks);
+    }
+    else {
+      logger.log(Level.SEVERE, "Using fixed rate sampler");
+      result =
+          fixedRateSampler.shouldSample(
+              parentContext, traceId, name, spanKind, attributes, parentLinks);
+    }
     if (result.getDecision() != SamplingDecision.DROP) {
       statistics.sampled.increment();
     }
     return result;
   }
 
+  void countTrace() {
+    statistics.traces.increment();
+  }
+
+  void captureError(ReadableSpan span, SpanData spanData, Consumer<ReadableSpan> spanBatcher) {
+    // Record encountered error
+    statistics.errors.increment();
+
+    if (spanBatcher == null) {
+      throw new IllegalStateException("Programming bug - Span exporter is null");
+    }
+    logger.log(Level.SEVERE, "Error span is being: Sampled={0}; ParentSampled={1}", new Object[] {
+        span.getSpanContext().isSampled(),
+        span.getParentSpanContext().isSampled()
+    });
+    if (span.getSpanContext().isSampled()) {
+      statistics.errorsSampled.increment();
+      return;
+    }
+
+    if (errorCaptureRateLimiter.trySpend(1)) {
+      logger.log(Level.SEVERE, "Error span is being CAPTURED due to error, after being left unsampled");
+      // Let BatchSpanProcessor accept the span directly to export accordingly
+      spanBatcher.accept(span);
+    }
+    else {
+      logger.log(Level.SEVERE, "Error span is being RATE-LIMITED despite error, after being left unsampled");
+    }
+  }
+
   @Nullable
-  SamplingStatisticsDocument snapshot(Date now) {
+  SamplingRuleStatisticsSnapshot snapshot(Date now) {
     if (clock.nanoTime() < nextSnapshotTimeNanos) {
       return null;
     }
-    return SamplingStatisticsDocument.newBuilder()
+    long totalCount = statistics.requests.sumThenReset();
+    long sampledCount = statistics.sampled.sumThenReset();
+    long borrowCount = statistics.borrowed.sumThenReset();
+    long traceCount = statistics.traces.sumThenReset();
+    long errorCount = statistics.errors.sumThenReset();
+    long errorSampledCount = statistics.errorsSampled.sumThenReset();
+    SamplingStatisticsDocument samplingStatistics = SamplingStatisticsDocument.newBuilder()
         .setClientId(clientId)
         .setRuleName(ruleName)
         .setTimestamp(now)
         // Resetting requests first ensures that sample / borrow rate are positive after the reset.
         // Snapshotting is not concurrent so this ensures they are always positive.
-        .setRequestCount(statistics.requests.sumThenReset())
-        .setSampledCount(statistics.sampled.sumThenReset())
-        .setBorrowCount(statistics.borrowed.sumThenReset())
+        .setRequestCount(totalCount)
+        .setSampledCount(sampledCount)
+        .setBorrowCount(borrowCount)
         .build();
+    List<SamplingBoostStatisticsDocument> samplingBoostStatistics = rulesWatchingThisService.stream().map(
+        watcherRuleName -> {
+          return SamplingBoostStatisticsDocument.newBuilder()
+              .setClientId(clientId)
+              .setRuleName(watcherRuleName)
+              .setServiceName(serviceName)
+              .setTimestamp(now)
+              .setTotalCount(traceCount)
+              .setErrorCount(errorCount)
+              .setErrorSampledCount(errorSampledCount)
+              .build();
+        })
+        .filter(doc -> doc.getTotalCount() > 0) // TODO: @majanjua - Aggregate better
+        .collect(Collectors.toList());
+    // TODO: @majanjua - Remove this extra logic, it assumes there is only 1 boost document for now
+    List<String> samplingBoostStatsDocs = samplingBoostStatistics.stream().map(doc -> {
+      return "{"
+          + "\"RuleName\":\"" + doc.getRuleName() + "\","
+          + "\"ServiceName\":\"" + doc.getServiceName() + "\","
+          + "\"ErrorCount\":" + doc.getErrorCount() + ","
+          + "\"TotalCount\":" + doc.getTotalCount() + ","
+          + "\"ErrorCountSampled\":" + doc.getErrorSampledCount()
+          + "}";
+    })
+    .collect(Collectors.toList());
+    return new SamplingRuleStatisticsSnapshot(samplingStatistics, samplingBoostStatsDocs);
   }
 
   long getNextSnapshotTimeNanos() {
     return nextSnapshotTimeNanos;
   }
 
-  SamplingRuleApplier withTarget(SamplingTargetDocument target, Date now) {
+  // currentNanoTime is passed in to ensure all uses of withTarget are used with the same baseline time reference
+  SamplingRuleApplier withTarget(SamplingTargetDocument target, Date now, long currentNanoTime) {
     Sampler newFixedRateSampler = createFixedRate(target.getFixedRate());
     Sampler newReservoirSampler = Sampler.alwaysOff();
-    long newReservoirEndTimeNanos = clock.nanoTime();
+    long newReservoirEndTimeNanos = currentNanoTime;
     // Not well documented but a quota should always come with a TTL
     if (target.getReservoirQuota() != null && target.getReservoirQuotaTtl() != null) {
       newReservoirSampler = createRateLimited(target.getReservoirQuota());
       newReservoirEndTimeNanos =
-          clock.nanoTime()
+          currentNanoTime
               + Duration.between(now.toInstant(), target.getReservoirQuotaTtl().toInstant())
                   .toNanos();
     }
@@ -283,16 +418,40 @@ final class SamplingRuleApplier {
         target.getIntervalSecs() != null
             ? TimeUnit.SECONDS.toNanos(target.getIntervalSecs())
             : AwsXrayRemoteSampler.DEFAULT_TARGET_INTERVAL_NANOS;
-    long newNextSnapshotTimeNanos = clock.nanoTime() + intervalNanos;
+    long newNextSnapshotTimeNanos = currentNanoTime + intervalNanos;
+
+    // TODO: @majanjua - Clean logic when the response is no longer a string
+    double newBoostedFixedRate = fixedRate;
+    long newBoostEndTimeNanos = currentNanoTime;
+    if (target.getSamplingBoost() != null) {
+      String samplingBoostMap = target.getSamplingBoost();
+      try {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> boostMap = new ObjectMapper().readValue(samplingBoostMap, Map.class);
+        if (boostMap.containsKey("BoostRate") && boostMap.containsKey("BoostRateTTL")) {
+          logger.log(Level.SEVERE, "CHECK - Boosting");
+          newBoostedFixedRate = Double.parseDouble(boostMap.get("BoostRate").toString());
+          newBoostEndTimeNanos = currentNanoTime + Duration.between(now.toInstant(), Instant.parse(boostMap.get("BoostRateTTL").toString())).toNanos();
+        }
+      } catch (JsonProcessingException e) {
+        logger.log(Level.SEVERE, "Error parsing boost map: {0}", samplingBoostMap);
+      }
+    }
 
     return new SamplingRuleApplier(
         clientId,
         ruleName,
+        serviceName,
         clock,
         newReservoirSampler,
         newReservoirEndTimeNanos,
+        fixedRate,
         newFixedRateSampler,
         /* borrowing= */ false,
+        errorsCapturedPerSecond,
+        rulesWatchingThisService,
+        newBoostedFixedRate,
+        newBoostEndTimeNanos,
         attributeMatchers,
         urlPathMatcher,
         serviceNameMatcher,
@@ -308,11 +467,17 @@ final class SamplingRuleApplier {
     return new SamplingRuleApplier(
         clientId,
         ruleName,
+        serviceName,
         clock,
         reservoirSampler,
         reservoirEndTimeNanos,
+        fixedRate,
         fixedRateSampler,
         borrowing,
+        errorsCapturedPerSecond,
+        rulesWatchingThisService,
+        boostedFixedRate,
+        boostEndTimeNanos,
         attributeMatchers,
         urlPathMatcher,
         serviceNameMatcher,
@@ -479,5 +644,27 @@ final class SamplingRuleApplier {
     final LongAdder requests = new LongAdder();
     final LongAdder sampled = new LongAdder();
     final LongAdder borrowed = new LongAdder();
+    final LongAdder traces = new LongAdder();
+    final LongAdder errors = new LongAdder();
+    final LongAdder errorsSampled = new LongAdder();
+  }
+
+  static class SamplingRuleStatisticsSnapshot {
+    final SamplingStatisticsDocument statisticsDocument;
+    final List<String> boostStatisticsDocument;
+    // final SamplingBoostStatisticsDocument boostStatisticsDocument;
+
+    SamplingRuleStatisticsSnapshot(SamplingStatisticsDocument statisticsDocument, List<String> boostStatisticsDocument) {
+      this.statisticsDocument = statisticsDocument;
+      this.boostStatisticsDocument = boostStatisticsDocument;
+    }
+
+    SamplingStatisticsDocument getStatisticsDocument() {
+      return statisticsDocument;
+    }
+
+    List<String> getBoostStatisticsDocument() {
+      return boostStatisticsDocument;
+    }
   }
 }

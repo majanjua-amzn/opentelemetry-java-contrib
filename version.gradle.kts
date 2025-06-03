@@ -1,4 +1,4 @@
-val stableVersion = "1.39.0"
+val stableVersion = "majanjua-SNAPSHOT"
 val alphaVersion = "1.39.0-alpha"
 
 allprojects {

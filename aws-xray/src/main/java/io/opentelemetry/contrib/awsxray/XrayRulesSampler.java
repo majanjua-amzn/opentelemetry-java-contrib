@@ -5,15 +5,21 @@
 
 package io.opentelemetry.contrib.awsxray;
 
+import static io.opentelemetry.semconv.HttpAttributes.HTTP_RESPONSE_STATUS_CODE;
+
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.trace.SpanContext;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.contrib.awsxray.GetSamplingTargetsResponse.SamplingTargetDocument;
 import io.opentelemetry.sdk.common.Clock;
 import io.opentelemetry.sdk.resources.Resource;
+import io.opentelemetry.sdk.trace.ReadableSpan;
 import io.opentelemetry.sdk.trace.data.LinkData;
+import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.samplers.Sampler;
 import io.opentelemetry.sdk.trace.samplers.SamplingResult;
+import io.opentelemetry.semconv.resource.attributes.ResourceAttributes;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Date;
@@ -21,9 +27,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+
+// import io.opentelemetry.api.common.AttributeKey;
 
 final class XrayRulesSampler implements Sampler {
 
@@ -46,11 +56,7 @@ final class XrayRulesSampler implements Sampler {
         resource,
         clock,
         fallbackSampler,
-        rules.stream()
-            // Lower priority value takes precedence so normal ascending sort.
-            .sorted(Comparator.comparingInt(GetSamplingRulesResponse.SamplingRule::getPriority))
-            .map(rule -> new SamplingRuleApplier(clientId, rule, clock))
-            .toArray(SamplingRuleApplier[]::new));
+        generateSamplingRuleAppliers(clientId, resource.getAttribute(ResourceAttributes.SERVICE_NAME), clock, rules));
   }
 
   private XrayRulesSampler(
@@ -66,6 +72,25 @@ final class XrayRulesSampler implements Sampler {
     this.ruleAppliers = ruleAppliers;
   }
 
+  private static SamplingRuleApplier[] generateSamplingRuleAppliers(
+      String clientId,
+      @Nullable String serviceName,
+      Clock clock,
+      List<GetSamplingRulesResponse.SamplingRule> rules) {
+    List<String> rulesWatchingThisService = rules.stream()
+            .filter(rule -> {
+                // TODO: @majanjua - This should check if the rule's `ServiceToMonitorForFault` includes this service's name
+                // Right now this assumes any rule with boost map is watching the current service
+                return rule.getSamplingRateBoost() != null; })
+            .map(rule -> rule.getRuleName())
+            .collect(Collectors.toList());
+    return rules.stream()
+            // Lower priority value takes precedence so normal ascending sort.
+            .sorted(Comparator.comparingInt(GetSamplingRulesResponse.SamplingRule::getPriority))
+            .map(rule -> new SamplingRuleApplier(clientId, rule, serviceName, rulesWatchingThisService, clock))
+            .toArray(SamplingRuleApplier[]::new);
+  }
+
   @Override
   public SamplingResult shouldSample(
       Context parentContext,
@@ -74,10 +99,19 @@ final class XrayRulesSampler implements Sampler {
       SpanKind spanKind,
       Attributes attributes,
       List<LinkData> parentLinks) {
+    logger.log(Level.SEVERE, "SPAN COUNTER BLABLA");
     for (SamplingRuleApplier applier : ruleAppliers) {
       if (applier.matches(attributes, resource)) {
-        return applier.shouldSample(
+        SamplingResult result = applier.shouldSample(
             parentContext, traceId, name, spanKind, attributes, parentLinks);
+        // AttributeKey<String> samplingRuleKey = AttributeKey.stringKey("aws.xray.sampling_rule");
+        // if (attributes.get(samplingRuleKey) == null) {
+        //   result = SamplingResult.create(result.getDecision(), Attributes.of(samplingRuleKey, applier.getRuleName()));
+        //   logger.log(Level.SEVERE, "Propagation test - Adding sampling rule name to span attributes: {0}", applier.getRuleName());
+        // } else {
+        //   logger.log(Level.SEVERE, "Propagation test - Sampling rule name already exists in span attributes: {0}", attributes.get(samplingRuleKey));
+        // }
+        return result;
       }
     }
 
@@ -96,7 +130,29 @@ final class XrayRulesSampler implements Sampler {
     return "XrayRulesSampler{" + Arrays.toString(ruleAppliers) + "}";
   }
 
-  List<GetSamplingTargetsRequest.SamplingStatisticsDocument> snapshot(Date now) {
+  void adaptSampling(ReadableSpan span, SpanData spanData, Consumer<ReadableSpan> spanBatcher) {
+    if (spanData.getAttributes().get(HTTP_RESPONSE_STATUS_CODE) == null) {
+      return;
+    }
+    Long statusCode = spanData.getAttributes().get(HTTP_RESPONSE_STATUS_CODE);
+    SpanContext parentContext = spanData.getParentSpanContext();
+    boolean isLocalRootSpan = parentContext == null || !parentContext.isValid() || parentContext.isRemote();
+    if (statusCode == null || statusCode > 299 || isLocalRootSpan) {
+      for (SamplingRuleApplier applier : ruleAppliers) {
+        if (applier.matches(spanData.getAttributes(), resource)) {
+          if (isLocalRootSpan) {
+            applier.countTrace();
+          }
+          if (statusCode == null || statusCode > 299) {
+            applier.captureError(span, spanData, spanBatcher);
+          }
+          return;
+        }
+      }
+    }
+  }
+
+  List<SamplingRuleApplier.SamplingRuleStatisticsSnapshot> snapshot(Date now) {
     return Arrays.stream(ruleAppliers)
         .map(rule -> rule.snapshot(now))
         .filter(Objects::nonNull)
@@ -115,15 +171,16 @@ final class XrayRulesSampler implements Sampler {
       Map<String, SamplingTargetDocument> ruleTargets,
       Set<String> requestedTargetRuleNames,
       Date now) {
+    long currentNanoTime = clock.nanoTime();
     long defaultNextSnapshotTimeNanos =
-        clock.nanoTime() + AwsXrayRemoteSampler.DEFAULT_TARGET_INTERVAL_NANOS;
+        currentNanoTime + AwsXrayRemoteSampler.DEFAULT_TARGET_INTERVAL_NANOS;
     SamplingRuleApplier[] newAppliers =
         Arrays.stream(ruleAppliers)
             .map(
                 rule -> {
                   SamplingTargetDocument target = ruleTargets.get(rule.getRuleName());
                   if (target != null) {
-                    return rule.withTarget(target, now);
+                    return rule.withTarget(target, now, currentNanoTime);
                   }
                   if (requestedTargetRuleNames.contains(rule.getRuleName())) {
                     // In practice X-Ray should return a target for any rule we requested but

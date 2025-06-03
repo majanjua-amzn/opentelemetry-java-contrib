@@ -39,9 +39,10 @@ abstract class GetSamplingTargetsResponse {
         @JsonProperty("Interval") @Nullable Integer intervalSecs,
         @JsonProperty("ReservoirQuota") @Nullable Integer reservoirQuota,
         @JsonProperty("ReservoirQuotaTTL") @Nullable Date reservoirQuotaTtl,
+        @JsonProperty("SamplingBoost") @Nullable String samplingBoost,
         @JsonProperty("RuleName") String ruleName) {
       return new AutoValue_GetSamplingTargetsResponse_SamplingTargetDocument(
-          fixedRate, intervalSecs, reservoirQuota, reservoirQuotaTtl, ruleName);
+          fixedRate, intervalSecs, reservoirQuota, reservoirQuotaTtl, samplingBoost, ruleName);
     }
 
     abstract double getFixedRate();
@@ -56,6 +57,9 @@ abstract class GetSamplingTargetsResponse {
     // expect for a Time to live.
     @Nullable
     abstract Date getReservoirQuotaTtl();
+
+    @Nullable
+    abstract String getSamplingBoost();
 
     abstract String getRuleName();
   }
@@ -78,4 +82,19 @@ abstract class GetSamplingTargetsResponse {
 
     abstract String getRuleName();
   }
+
+  // @AutoValue
+  // abstract static class SamplingBoost {
+  //   @JsonCreator
+  //   static SamplingBoost create(
+  //       @JsonProperty("BoostRate") double boostRate,
+  //       @JsonProperty("BoostRateTTL") Date boostRateTtl) {
+  //     return new AutoValue_GetSamplingTargetsResponse_SamplingBoost(
+  //         boostRate, boostRateTtl);
+  //   }
+
+  //   abstract double getBoostRate();
+
+  //   abstract Date getBoostRateTtl();
+  // }
 }
