@@ -35,6 +35,11 @@ final class SamplingRuleApplier {
 
   private static final Map<String, String> XRAY_CLOUD_PLATFORM;
 
+  private static final AttributeKey<String> URL_PATH = AttributeKey.stringKey("url.path");
+  private static final AttributeKey<String> URL_FULL = AttributeKey.stringKey("url.full");
+  private static final AttributeKey<String> HTTP_REQUEST_METHOD =
+      AttributeKey.stringKey("http.request.method");
+
   static {
     Map<String, String> xrayCloudPlatform = new HashMap<>();
     xrayCloudPlatform.put(ResourceAttributes.CloudPlatformValues.AWS_EC2, "AWS::EC2::Instance");
@@ -162,11 +167,14 @@ final class SamplingRuleApplier {
     String host = null;
 
     for (Map.Entry<AttributeKey<?>, Object> entry : attributes.asMap().entrySet()) {
-      if (entry.getKey().equals(SemanticAttributes.HTTP_TARGET)) {
+      if (entry.getKey().equals(SemanticAttributes.HTTP_TARGET)
+          || entry.getKey().equals(URL_PATH)) {
         httpTarget = (String) entry.getValue();
-      } else if (entry.getKey().equals(SemanticAttributes.HTTP_URL)) {
+      } else if (entry.getKey().equals(SemanticAttributes.HTTP_URL)
+          || entry.getKey().equals(URL_FULL)) {
         httpUrl = (String) entry.getValue();
-      } else if (entry.getKey().equals(SemanticAttributes.HTTP_METHOD)) {
+      } else if (entry.getKey().equals(SemanticAttributes.HTTP_METHOD)
+          || entry.getKey().equals(HTTP_REQUEST_METHOD)) {
         httpMethod = (String) entry.getValue();
       } else if (entry.getKey().equals(SemanticAttributes.NET_HOST_NAME)) {
         host = (String) entry.getValue();
