@@ -68,6 +68,9 @@ public final class AwsXrayPropagator implements TextMapPropagator {
   private static final char IS_SAMPLED = '1';
   private static final char NOT_SAMPLED = '0';
 
+  // Copied from AwsSamplingResult in aws-xray extension
+  private static final String AWS_XRAY_SAMPLING_RULE_TRACE_STATE_KEY = "xrsr";
+
   private static final List<String> FIELDS = Collections.singletonList(TRACE_HEADER_KEY);
 
   private static final AwsXrayPropagator INSTANCE = new AwsXrayPropagator();
@@ -127,6 +130,16 @@ public final class AwsXrayPropagator implements TextMapPropagator {
         .append(samplingFlag);
 
     Baggage baggage = Baggage.fromContext(context);
+    // Get sampling rule from trace state and inject into baggage
+    // This is a back up in case the next service does not have trace state propagation
+    String ruleFromTraceState =
+        spanContext.getTraceState().get(AWS_XRAY_SAMPLING_RULE_TRACE_STATE_KEY);
+    if (ruleFromTraceState != null) {
+      baggage =
+          baggage.toBuilder()
+              .put(AWS_XRAY_SAMPLING_RULE_TRACE_STATE_KEY, ruleFromTraceState)
+              .build();
+    }
     // Truncate baggage to 256 chars per X-Ray spec.
     baggage.forEach(
         new BiConsumer<String, BaggageEntry>() {
@@ -236,13 +249,15 @@ public final class AwsXrayPropagator implements TextMapPropagator {
     if (spanId == null || traceId == null) {
       logger.finest("Both traceId and spanId are required to extract a valid span context. ");
     }
-
+    SpanContext upstreamSpanContext = Span.fromContext(context).getSpanContext();
     SpanContext spanContext =
         SpanContext.createFromRemoteParent(
             StringUtils.padLeft(traceId, TraceId.getLength()),
             spanId,
             isSampled ? TraceFlags.getSampled() : TraceFlags.getDefault(),
-            TraceState.getDefault());
+            upstreamSpanContext.isValid()
+                ? upstreamSpanContext.getTraceState()
+                : TraceState.getDefault());
     if (spanContext.isValid()) {
       context = context.with(Span.wrap(spanContext));
     }
