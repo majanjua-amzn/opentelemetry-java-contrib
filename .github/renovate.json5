@@ -176,5 +176,27 @@
         'npx (?<depName>[^@]+)@(?<currentValue>[^\\s]+)',
       ],
     },
+    {
+      customType: 'regex',
+      datasourceTemplate: 'java-version',
+      managerFilePatterns: [
+        '.github/workflows/**',
+      ],
+      matchStrings: [
+        '(?<currentValue>\\d+) # renovate: datasource=java-version',
+      ],
+      depNameTemplate: 'java',
+      extractVersionTemplate: '^(?<version>\\d+)',
+    },
+    {
+      customType: 'regex',
+      datasourceTemplate: 'github-releases',
+      managerFilePatterns: [
+        '**/build.gradle.kts',
+      ],
+      matchStrings: [
+        '"https://github.com/(?<depName>[^/]+/[^/]+)/zipball/(?<currentValue>.+?)"',
+      ],
+    },
   ],
 }
